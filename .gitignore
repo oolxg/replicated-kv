@@ -1,0 +1,20 @@
+# Compiled binaries
+/bin/
+*.exe
+*.test
+.idea
+# Test / coverage artifacts
+*.out
+coverage.*
+
+# Terraform state and local config (never commit credentials or state)
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+!*.tfvars.example
+.terraform.lock.hcl
+
+# OS noise
+.DS_Store
