@@ -37,7 +37,7 @@ limitations slide).
 | Layer | Scope | Status |
 |------:|-------|:------:|
 | 1 | Standalone storage node — sharded in-memory store + internal HTTP API | ✅ |
-| 2 | Router + consistent-hash ring + forwarding (RF=1) | ⏳ |
+| 2 | Router + consistent-hash ring + forwarding (RF=1) | ✅ |
 | 3 | Replication + quorum + LWW reconcile | ⏳ |
 | 4 | Load shedding (overload mitigation) | ⏳ |
 | 5 | Retries (backoff + jitter) + read-through cache | ⏳ |
@@ -81,6 +81,39 @@ curl -s -XPUT localhost:8080/internal/put/foo \
 curl -s localhost:8080/internal/get/foo   # -> {"value":"bar","timestamp":1}
 curl -s localhost:8080/healthz            # -> {"status":"ok"}
 ```
+
+## Layer 2 — router + ring + forwarding (RF=1)
+
+The stateless tier. The router owns a consistent-hash ring (150 virtual nodes
+per physical node, SHA-256 placement) and forwards each client request to the
+single node responsible for the key. It assigns the write timestamp, so LWW has
+one clock per write path. No replication yet (RF=1).
+
+### Client-facing HTTP API (on the router)
+
+| Method | Path | Body | Responses |
+|--------|------|------|-----------|
+| `GET` | `/kv/{key}` | — | `200 {value,timestamp}` · `404` · `502` |
+| `PUT` | `/kv/{key}` | `{value}` | `200` · `400` · `502` |
+| `GET` | `/healthz` | — | `200` |
+
+### Run it (1 router + 3 storage nodes, locally)
+
+```sh
+go build -o bin/router ./cmd/router
+go build -o bin/storage ./cmd/storage
+
+KV_ADDR=:19001 ./bin/storage &
+KV_ADDR=:19002 ./bin/storage &
+KV_ADDR=:19003 ./bin/storage &
+KV_ADDR=:19000 KV_NODES=127.0.0.1:19001,127.0.0.1:19002,127.0.0.1:19003 ./bin/router &
+
+curl -s -XPUT localhost:19000/kv/apple -d '{"value":"apple-v"}'  # -> 200
+curl -s localhost:19000/kv/apple    # -> {"value":"apple-v","timestamp":...}
+```
+
+`KV_NODES` is the static membership list (comma-separated `host:port`), injected
+at deploy time. `KV_ADDR` defaults to `:8080`.
 
 ## License
 
