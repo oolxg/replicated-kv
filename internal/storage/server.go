@@ -17,8 +17,10 @@ import (
 // maxBodyBytes caps the request body the node will read. Bounding per-request
 // memory keeps a malformed or hostile client from exhausting the heap; it is a
 // basic robustness measure, distinct from the load-shedding added in a later
-// layer.
-const maxBodyBytes = 1 << 20 // 1 MiB
+// layer. It is deliberately larger than the router's 1 MiB client-facing cap:
+// the internal envelope adds a timestamp field, so a value the router accepted
+// must never be rejected here.
+const maxBodyBytes = 2 << 20 // 2 MiB
 
 type putRequest struct {
 	Value     string `json:"value"`
