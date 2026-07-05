@@ -27,7 +27,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	coord := coordinator.New(ring.New(cfg.Nodes), logger)
+	if cfg.W+cfg.R <= cfg.RF {
+		logger.Warn("W+R <= RF: reads are not guaranteed to observe the newest write",
+			"rf", cfg.RF, "w", cfg.W, "r", cfg.R)
+	}
+	coord := coordinator.New(ring.New(cfg.Nodes), cfg.RF, cfg.W, cfg.R, logger)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -43,7 +47,8 @@ func main() {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		logger.Info("router listening", "addr", cfg.Addr, "nodes", cfg.Nodes)
+		logger.Info("router listening",
+			"addr", cfg.Addr, "nodes", cfg.Nodes, "rf", cfg.RF, "w", cfg.W, "r", cfg.R)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 		}
