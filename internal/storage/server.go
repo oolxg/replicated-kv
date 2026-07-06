@@ -11,14 +11,17 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/oolxg/replicated-kv/internal/shed"
 	"github.com/oolxg/replicated-kv/internal/store"
 )
 
 // maxBodyBytes caps the request body the node will read. Bounding per-request
 // memory keeps a malformed or hostile client from exhausting the heap; it is a
 // basic robustness measure, distinct from the load-shedding added in a later
-// layer.
-const maxBodyBytes = 1 << 20 // 1 MiB
+// layer. It is deliberately larger than the router's 1 MiB client-facing cap:
+// the internal envelope adds a timestamp field, so a value the router accepted
+// must never be rejected here.
+const maxBodyBytes = 2 << 20 // 2 MiB
 
 type putRequest struct {
 	Value     string `json:"value"`
@@ -37,21 +40,25 @@ type putResponse struct {
 // Handler serves the storage node's internal API.
 type Handler struct {
 	store *store.Store
+	lim   *shed.Limiter
 	log   *slog.Logger
 }
 
-// NewHandler returns a Handler backed by s. log must be non-nil.
-func NewHandler(s *store.Store, log *slog.Logger) *Handler {
-	return &Handler{store: s, log: log}
+// NewHandler returns a Handler backed by s, load-shedding through lim.
+// lim and log must be non-nil.
+func NewHandler(s *store.Store, lim *shed.Limiter, log *slog.Logger) *Handler {
+	return &Handler{store: s, lim: lim, log: log}
 }
 
 // Routes builds the HTTP handler. Patterns use the method-aware matching of
 // the Go 1.22+ ServeMux, so a method/path mismatch yields 404/405 for free and
-// no third-party router is required.
+// no third-party router is required. The data endpoints sit behind the load
+// shedder; /healthz deliberately does not — a saturated node is overloaded,
+// not dead, and its health checks must keep saying so.
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /internal/get/{key}", h.handleGet)
-	mux.HandleFunc("PUT /internal/put/{key}", h.handlePut)
+	mux.Handle("GET /internal/get/{key}", shed.Middleware(h.lim, http.HandlerFunc(h.handleGet)))
+	mux.Handle("PUT /internal/put/{key}", shed.Middleware(h.lim, http.HandlerFunc(h.handlePut)))
 	mux.HandleFunc("GET /healthz", h.handleHealth)
 	return mux
 }

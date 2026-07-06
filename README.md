@@ -38,8 +38,8 @@ limitations slide).
 |------:|-------|:------:|
 | 1 | Standalone storage node — sharded in-memory store + internal HTTP API | ✅ |
 | 2 | Router + consistent-hash ring + forwarding (RF=1) | ✅ |
-| 3 | Replication + quorum + LWW reconcile | ⏳ |
-| 4 | Load shedding (overload mitigation) | ⏳ |
+| 3 | Replication + quorum + LWW reconcile + read-repair | ✅ |
+| 4 | Load shedding (overload mitigation) | ✅ |
 | 5 | Retries (backoff + jitter) + read-through cache | ⏳ |
 | 6 | Terraform deploy (1 / 3 / 5 nodes) | ⏳ |
 | 7 | k6 benchmark + scaling graph | ⏳ |
@@ -93,8 +93,8 @@ one clock per write path. No replication yet (RF=1).
 
 | Method | Path | Body | Responses |
 |--------|------|------|-----------|
-| `GET` | `/kv/{key}` | — | `200 {value,timestamp}` · `404` · `502` |
-| `PUT` | `/kv/{key}` | `{value}` | `200` · `400` · `502` |
+| `GET` | `/kv/{key}` | — | `200 {value,timestamp}` · `404` · `504` (no quorum) |
+| `PUT` | `/kv/{key}` | `{value}` | `200` · `400` · `413` (value > 1 MiB) · `504` (no quorum) |
 | `GET` | `/healthz` | — | `200` |
 
 ### Run it (1 router + 3 storage nodes, locally)
@@ -114,6 +114,86 @@ curl -s localhost:19000/kv/apple    # -> {"value":"apple-v","timestamp":...}
 
 `KV_NODES` is the static membership list (comma-separated `host:port`), injected
 at deploy time. `KV_ADDR` defaults to `:8080`.
+
+## Layer 3 — replication + quorum + read-repair
+
+Dynamo-style quorum replication:
+
+- **PUT**: the router assigns the timestamp, fans the write out to all **RF**
+  replicas of the key (from the ring's preference list) and replies once **W**
+  have acked; stragglers keep applying the write in the background. Fewer than
+  W acks → `504`.
+- **GET**: fans out to all RF replicas, replies once **R** have answered, and
+  returns the newest version among them (LWW: timestamp, then value bytes —
+  the same total order the replicas converge to). A replica's "not found"
+  counts toward R. Fewer than R answers → `504`.
+- **Read-repair**: replicas observed stale/missing during a read are healed
+  asynchronously with the winning version. Opportunistic: with R < RF only
+  replicas that answered within the quorum window are repaired, so a restarted
+  node heals within a few reads, not necessarily the first.
+
+### Quorum configuration
+
+Defaults derive from the node count — the assignment's three configs need no
+explicit tuning:
+
+| Config | nodes | RF | W | R |
+|--------|-------|----|---|---|
+| single | 1 | 1 | 1 | 1 |
+| 3-node | 3 | 3 | 2 | 2 |
+| 5-node | 5 | 3 | 2 | 2 |
+
+`W+R > RF` → a read quorum always overlaps the newest committed write.
+Override with `KV_RF` / `KV_W` / `KV_R` (validated: `1 ≤ W,R ≤ RF ≤ nodes`).
+
+Note: reads contact all RF replicas and wait for the fastest R, so replication
+trades read throughput for availability. Throughput scaling benchmarks run
+with `KV_RF=1` (pure sharding); replication is the fault-tolerance demo.
+
+### Fault-tolerance demo (RF=3, W=2, R=2)
+
+```sh
+# cluster up (see Layer 2), then:
+curl -XPUT localhost:19000/kv/alpha -d '{"value":"a1"}'   # replicated to all 3
+kill -9 <pid of one storage node>
+curl localhost:19000/kv/alpha                             # still 200 (R=2)
+curl -XPUT localhost:19000/kv/beta -d '{"value":"b1"}'    # still 200 (W=2)
+# restart the killed node (empty) — a few reads later read-repair has healed it:
+curl localhost:19002/internal/get/alpha                   # 200 again
+```
+
+## Layer 4 — load shedding (overload mitigation)
+
+Hand-implemented (assignment requirement: no rate-limiting libraries) in
+`internal/shed`: a counting semaphore bounds concurrent requests, a bounded
+queue absorbs bursts, and anything beyond both is answered **503 immediately**
+instead of joining an unbounded backlog. Refusing excess work keeps the node's
+latency flat under any overload — the alternative (queueing everything) melts
+into timeouts and OOM.
+
+- **Storage nodes** shed on the internal data endpoints — the stateful tier
+  can never be overwhelmed by router fan-in.
+- **Router** sheds at the client-facing edge, before any fan-out work.
+- `/healthz` bypasses shedding on both tiers: a saturated node is overloaded,
+  not dead.
+- The router counts a replica's 503 as a quorum failure (same as a dead node),
+  so a saturated replica degrades into the standard quorum story: tolerated up
+  to `RF−W` / `RF−R`, then `504` to the client.
+
+Tuning: `KV_SHED_CONCURRENT` / `KV_SHED_QUEUE` (defaults: storage 256/512,
+router 1024/1024).
+
+Measured under a 100-VU k6 hammer against one storage node deliberately
+limited to a single slot (`KV_SHED_CONCURRENT=1 KV_SHED_QUEUE=0`):
+
+```
+status_200: 318k (63.7k/s)    status_503: 147k (29.3k/s, shed)
+p95 = 2.43ms  max = 36.8ms    ← same p95 as an unloaded run: no queue buildup
+```
+
+The node kept serving, health checks stayed green, and the latency of
+*admitted* requests did not degrade — overload cost the excess callers a 503,
+not everyone a timeout.
 
 ## License
 

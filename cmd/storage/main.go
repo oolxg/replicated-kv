@@ -7,7 +7,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,20 +14,26 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/oolxg/replicated-kv/internal/config"
+	"github.com/oolxg/replicated-kv/internal/shed"
 	"github.com/oolxg/replicated-kv/internal/storage"
 	"github.com/oolxg/replicated-kv/internal/store"
 )
 
 func main() {
-	addr := flag.String("addr", envOr("KV_ADDR", ":8080"), "HTTP listen address")
-	flag.Parse()
-
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	handler := storage.NewHandler(store.New(), logger)
+	cfg, err := config.StorageFromEnv()
+	if err != nil {
+		logger.Error("configuration error", "err", err)
+		os.Exit(1)
+	}
+
+	limiter := shed.New(cfg.ShedConcurrent, cfg.ShedQueue)
+	handler := storage.NewHandler(store.New(), limiter, logger)
 
 	srv := &http.Server{
-		Addr:              *addr,
+		Addr:              cfg.Addr,
 		Handler:           handler.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -42,7 +47,8 @@ func main() {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		logger.Info("storage node listening", "addr", *addr)
+		logger.Info("storage node listening",
+			"addr", cfg.Addr, "shed_concurrent", cfg.ShedConcurrent, "shed_queue", cfg.ShedQueue)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 		}
@@ -63,11 +69,4 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("storage node stopped")
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }
