@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/oolxg/replicated-kv/internal/ring"
+	"github.com/oolxg/replicated-kv/internal/shed"
 )
 
 const (
@@ -66,18 +67,20 @@ type replicaRead struct {
 type Coordinator struct {
 	ring     *ring.Ring
 	rf, w, r int
+	lim      *shed.Limiter
 	client   *http.Client
 	log      *slog.Logger
 }
 
-// New returns a Coordinator over rg with the given quorum parameters.
-// log must be non-nil.
-func New(rg *ring.Ring, rf, w, r int, log *slog.Logger) *Coordinator {
+// New returns a Coordinator over rg with the given quorum parameters,
+// shedding excess client load through lim. lim and log must be non-nil.
+func New(rg *ring.Ring, rf, w, r int, lim *shed.Limiter, log *slog.Logger) *Coordinator {
 	return &Coordinator{
 		ring: rg,
 		rf:   rf,
 		w:    w,
 		r:    r,
+		lim:  lim,
 		client: &http.Client{
 			Timeout: nodeRequestTimeout,
 			// Tuned for connection reuse to each storage node under load; the
@@ -263,11 +266,13 @@ func (c *Coordinator) repair(key string, winner Versioned, reads []replicaRead) 
 
 // --- client-facing HTTP API ---
 
-// Routes returns the client-facing HTTP handler.
+// Routes returns the client-facing HTTP handler. Data endpoints sit behind
+// the edge load shedder (excess load answers 503 before any fan-out work);
+// /healthz stays outside it.
 func (c *Coordinator) Routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /kv/{key}", c.handleGet)
-	mux.HandleFunc("PUT /kv/{key}", c.handlePut)
+	mux.Handle("GET /kv/{key}", shed.Middleware(c.lim, http.HandlerFunc(c.handleGet)))
+	mux.Handle("PUT /kv/{key}", shed.Middleware(c.lim, http.HandlerFunc(c.handlePut)))
 	mux.HandleFunc("GET /healthz", c.handleHealth)
 	return mux
 }

@@ -23,6 +23,50 @@ type Config struct {
 	RF int // replication factor: how many replicas hold each key
 	W  int // write quorum: acks required before a PUT succeeds
 	R  int // read quorum: replies required before a GET succeeds
+
+	// Load-shedding bounds for the client-facing edge (KV_SHED_CONCURRENT /
+	// KV_SHED_QUEUE). Requests beyond concurrent+queue are answered 503.
+	ShedConcurrent int
+	ShedQueue      int
+}
+
+// StorageConfig is a storage node's runtime configuration.
+type StorageConfig struct {
+	Addr string // listen address, e.g. ":8080"
+
+	// Load-shedding bounds for the internal API. Storage handlers are
+	// microsecond-fast in-memory operations, so the limit exists to bound
+	// goroutine and memory blowup under fan-in from multiple routers, not to
+	// pace the CPU.
+	ShedConcurrent int
+	ShedQueue      int
+}
+
+// StorageFromEnv reads KV_ADDR (default ":8080") and optional
+// KV_SHED_CONCURRENT / KV_SHED_QUEUE overrides.
+func StorageFromEnv() (StorageConfig, error) {
+	c := StorageConfig{Addr: envOr("KV_ADDR", ":8080")}
+	var err error
+	if c.ShedConcurrent, err = intEnv("KV_SHED_CONCURRENT", 256); err != nil {
+		return StorageConfig{}, err
+	}
+	if c.ShedQueue, err = intEnv("KV_SHED_QUEUE", 512); err != nil {
+		return StorageConfig{}, err
+	}
+	if err := validateShed(c.ShedConcurrent, c.ShedQueue); err != nil {
+		return StorageConfig{}, err
+	}
+	return c, nil
+}
+
+func validateShed(concurrent, queue int) error {
+	if concurrent < 1 {
+		return fmt.Errorf("KV_SHED_CONCURRENT=%d must be at least 1", concurrent)
+	}
+	if queue < 0 {
+		return fmt.Errorf("KV_SHED_QUEUE=%d must not be negative", queue)
+	}
+	return nil
 }
 
 // FromEnv reads KV_ADDR (default ":8080"), KV_NODES (required, comma-separated
@@ -62,6 +106,18 @@ func FromEnv() (Config, error) {
 	}
 	if c.R < 1 || c.R > c.RF {
 		return Config{}, fmt.Errorf("KV_R=%d must be between 1 and KV_RF (%d)", c.R, c.RF)
+	}
+
+	// The router is IO-bound fan-out work, so its edge admits more
+	// concurrency than a storage node by default.
+	if c.ShedConcurrent, err = intEnv("KV_SHED_CONCURRENT", 1024); err != nil {
+		return Config{}, err
+	}
+	if c.ShedQueue, err = intEnv("KV_SHED_QUEUE", 1024); err != nil {
+		return Config{}, err
+	}
+	if err := validateShed(c.ShedConcurrent, c.ShedQueue); err != nil {
+		return Config{}, err
 	}
 	return c, nil
 }

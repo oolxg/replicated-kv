@@ -64,11 +64,21 @@ func TestFromEnv(t *testing.T) {
 			env:     map[string]string{"KV_NODES": "a:1", "KV_RF": "lots"},
 			wantErr: "not an integer",
 		},
+		{
+			name:    "zero shed concurrency rejected",
+			env:     map[string]string{"KV_NODES": "a:1", "KV_SHED_CONCURRENT": "0"},
+			wantErr: "KV_SHED_CONCURRENT=0",
+		},
+		{
+			name:    "negative shed queue rejected",
+			env:     map[string]string{"KV_NODES": "a:1", "KV_SHED_QUEUE": "-5"},
+			wantErr: "KV_SHED_QUEUE=-5",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			for _, k := range []string{"KV_ADDR", "KV_NODES", "KV_RF", "KV_W", "KV_R"} {
+			for _, k := range []string{"KV_ADDR", "KV_NODES", "KV_RF", "KV_W", "KV_R", "KV_SHED_CONCURRENT", "KV_SHED_QUEUE"} {
 				t.Setenv(k, tt.env[k]) // empty string reads as unset
 			}
 			c, err := FromEnv()

@@ -15,11 +15,16 @@ import (
 	"time"
 
 	"github.com/oolxg/replicated-kv/internal/ring"
+	"github.com/oolxg/replicated-kv/internal/shed"
 	"github.com/oolxg/replicated-kv/internal/storage"
 	"github.com/oolxg/replicated-kv/internal/store"
 )
 
 func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// wideShed returns a limiter generous enough to never shed in tests that are
+// not about shedding.
+func wideShed() *shed.Limiter { return shed.New(1024, 1024) }
 
 // testNode is one real storage node: its HTTP server plus a handle on the
 // underlying store, so tests can seed or inspect replica state directly.
@@ -36,7 +41,7 @@ func startNodes(t *testing.T, n int) []*testNode {
 	nodes := make([]*testNode, 0, n)
 	for i := 0; i < n; i++ {
 		st := store.New()
-		srv := httptest.NewServer(storage.NewHandler(st, discardLog()).Routes())
+		srv := httptest.NewServer(storage.NewHandler(st, wideShed(), discardLog()).Routes())
 		t.Cleanup(srv.Close)
 		nodes = append(nodes, &testNode{
 			addr:  strings.TrimPrefix(srv.URL, "http://"),
@@ -61,7 +66,7 @@ func newCoord(t *testing.T, nodes []*testNode) *Coordinator {
 	t.Helper()
 	a := addrsOf(nodes)
 	rf := min(3, len(a))
-	return New(ring.New(a), rf, rf/2+1, rf/2+1, discardLog())
+	return New(ring.New(a), rf, rf/2+1, rf/2+1, wideShed(), discardLog())
 }
 
 // waitFor polls cond until it holds or the deadline passes.
@@ -148,7 +153,7 @@ func TestCoordinatorGetMissing(t *testing.T) {
 
 func TestSingleNodeDegeneratesToLayer2(t *testing.T) {
 	nodes := startNodes(t, 1)
-	c := New(ring.New(addrsOf(nodes)), 1, 1, 1, discardLog())
+	c := New(ring.New(addrsOf(nodes)), 1, 1, 1, wideShed(), discardLog())
 	ctx := context.Background()
 
 	if err := c.Put(ctx, "k", "v"); err != nil {
@@ -300,7 +305,7 @@ func TestGetReconcileNewestWins(t *testing.T) {
 func TestReadRepairHeals(t *testing.T) {
 	t.Run("missing replica", func(t *testing.T) {
 		nodes := startNodes(t, 3)
-		c := New(ring.New(addrsOf(nodes)), 3, 2, 3, discardLog())
+		c := New(ring.New(addrsOf(nodes)), 3, 2, 3, wideShed(), discardLog())
 
 		nodes[0].store.Put("k", []byte("v"), 5)
 		nodes[1].store.Put("k", []byte("v"), 5)
@@ -318,7 +323,7 @@ func TestReadRepairHeals(t *testing.T) {
 
 	t.Run("stale replica", func(t *testing.T) {
 		nodes := startNodes(t, 3)
-		c := New(ring.New(addrsOf(nodes)), 3, 2, 3, discardLog())
+		c := New(ring.New(addrsOf(nodes)), 3, 2, 3, wideShed(), discardLog())
 
 		nodes[0].store.Put("k", []byte("stale"), 1)
 		nodes[1].store.Put("k", []byte("fresh"), 2)
@@ -368,7 +373,7 @@ func TestTimeoutCountsAsFailure(t *testing.T) {
 				t.Cleanup(hang.Close)
 				all = append(all, strings.TrimPrefix(hang.URL, "http://"))
 			}
-			c := New(ring.New(all), 3, 2, 2, discardLog())
+			c := New(ring.New(all), 3, 2, 2, wideShed(), discardLog())
 			c.client.Timeout = 250 * time.Millisecond // fail hanging calls fast
 
 			err := c.Put(context.Background(), "k", "v")
@@ -444,6 +449,58 @@ func TestLargeValuesSurviveInternalReencoding(t *testing.T) {
 			}
 			if got.Value != tt.value {
 				t.Fatalf("value corrupted in transit: len %d, want %d", len(got.Value), len(tt.value))
+			}
+		})
+	}
+}
+
+// TestReplicaShedCountsAsFailure: a replica answering 503 (load shedding)
+// must count against the quorum exactly like a dead one — the router must
+// neither treat 503 as success nor retry into the saturated node here.
+func TestReplicaShedCountsAsFailure(t *testing.T) {
+	tests := []struct {
+		name     string
+		healthy  int
+		shedding int
+		wantErr  bool
+	}{
+		{"one shedding of three tolerated", 2, 1, false},
+		{"two shedding of three break quorum", 1, 2, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nodes := startNodes(t, tt.healthy)
+			all := addrsOf(nodes)
+			for range tt.shedding {
+				overloaded := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					http.Error(w, "overloaded", http.StatusServiceUnavailable)
+				}))
+				t.Cleanup(overloaded.Close)
+				all = append(all, strings.TrimPrefix(overloaded.URL, "http://"))
+			}
+			c := New(ring.New(all), 3, 2, 2, wideShed(), discardLog())
+
+			err := c.Put(context.Background(), "k", "v")
+			if tt.wantErr {
+				if !errors.Is(err, errNoQuorum) {
+					t.Fatalf("put err = %v, want errNoQuorum", err)
+				}
+			} else if err != nil {
+				t.Fatalf("put with %d shedding replicas: %v", tt.shedding, err)
+			}
+
+			for _, n := range nodes {
+				n.store.Put("k", []byte("v"), 5)
+			}
+			v, found, err := c.Get(context.Background(), "k")
+			if tt.wantErr {
+				if !errors.Is(err, errNoQuorum) {
+					t.Fatalf("get err = %v, want errNoQuorum", err)
+				}
+				return
+			}
+			if err != nil || !found || v.Value != "v" {
+				t.Fatalf("get with %d shedding replicas: %q found=%v err=%v", tt.shedding, v.Value, found, err)
 			}
 		})
 	}

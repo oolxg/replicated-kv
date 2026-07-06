@@ -39,7 +39,7 @@ limitations slide).
 | 1 | Standalone storage node — sharded in-memory store + internal HTTP API | ✅ |
 | 2 | Router + consistent-hash ring + forwarding (RF=1) | ✅ |
 | 3 | Replication + quorum + LWW reconcile + read-repair | ✅ |
-| 4 | Load shedding (overload mitigation) | ⏳ |
+| 4 | Load shedding (overload mitigation) | ✅ |
 | 5 | Retries (backoff + jitter) + read-through cache | ⏳ |
 | 6 | Terraform deploy (1 / 3 / 5 nodes) | ⏳ |
 | 7 | k6 benchmark + scaling graph | ⏳ |
@@ -161,6 +161,39 @@ curl -XPUT localhost:19000/kv/beta -d '{"value":"b1"}'    # still 200 (W=2)
 # restart the killed node (empty) — a few reads later read-repair has healed it:
 curl localhost:19002/internal/get/alpha                   # 200 again
 ```
+
+## Layer 4 — load shedding (overload mitigation)
+
+Hand-implemented (assignment requirement: no rate-limiting libraries) in
+`internal/shed`: a counting semaphore bounds concurrent requests, a bounded
+queue absorbs bursts, and anything beyond both is answered **503 immediately**
+instead of joining an unbounded backlog. Refusing excess work keeps the node's
+latency flat under any overload — the alternative (queueing everything) melts
+into timeouts and OOM.
+
+- **Storage nodes** shed on the internal data endpoints — the stateful tier
+  can never be overwhelmed by router fan-in.
+- **Router** sheds at the client-facing edge, before any fan-out work.
+- `/healthz` bypasses shedding on both tiers: a saturated node is overloaded,
+  not dead.
+- The router counts a replica's 503 as a quorum failure (same as a dead node),
+  so a saturated replica degrades into the standard quorum story: tolerated up
+  to `RF−W` / `RF−R`, then `504` to the client.
+
+Tuning: `KV_SHED_CONCURRENT` / `KV_SHED_QUEUE` (defaults: storage 256/512,
+router 1024/1024).
+
+Measured under a 100-VU k6 hammer against one storage node deliberately
+limited to a single slot (`KV_SHED_CONCURRENT=1 KV_SHED_QUEUE=0`):
+
+```
+status_200: 318k (63.7k/s)    status_503: 147k (29.3k/s, shed)
+p95 = 2.43ms  max = 36.8ms    ← same p95 as an unloaded run: no queue buildup
+```
+
+The node kept serving, health checks stayed green, and the latency of
+*admitted* requests did not degrade — overload cost the excess callers a 503,
+not everyone a timeout.
 
 ## License
 

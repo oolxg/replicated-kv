@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -9,12 +10,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/oolxg/replicated-kv/internal/shed"
 	"github.com/oolxg/replicated-kv/internal/store"
 )
 
 func newTestHandler() http.Handler {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewHandler(store.New(), logger).Routes()
+	return NewHandler(store.New(), shed.New(64, 64), logger).Routes()
 }
 
 func do(t *testing.T, h http.Handler, method, target, body string) *httptest.ResponseRecorder {
@@ -137,5 +139,32 @@ func TestHTTPValueRoundTrip(t *testing.T) {
 	}
 	if gr.Value != payload.Value {
 		t.Fatalf("value not preserved:\n got %q\nwant %q", gr.Value, payload.Value)
+	}
+}
+
+// TestShedWiring pins down which routes sit behind the limiter: data
+// endpoints shed with 503 when the node is saturated, /healthz never does.
+func TestShedWiring(t *testing.T) {
+	lim := shed.New(1, 0)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := NewHandler(store.New(), lim, logger).Routes()
+
+	if !lim.Acquire(context.Background()) {
+		t.Fatal("failed to occupy the only slot")
+	}
+
+	if rec := do(t, h, http.MethodPut, "/internal/put/k", `{"value":"v","timestamp":1}`); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("saturated put status = %d, want 503", rec.Code)
+	}
+	if rec := do(t, h, http.MethodGet, "/internal/get/k", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("saturated get status = %d, want 503", rec.Code)
+	}
+	if rec := do(t, h, http.MethodGet, "/healthz", ""); rec.Code != http.StatusOK {
+		t.Fatalf("healthz under saturation status = %d, want 200 (must bypass shedding)", rec.Code)
+	}
+
+	lim.Release()
+	if rec := do(t, h, http.MethodPut, "/internal/put/k", `{"value":"v","timestamp":1}`); rec.Code != http.StatusOK {
+		t.Fatalf("put after release status = %d, want 200", rec.Code)
 	}
 }

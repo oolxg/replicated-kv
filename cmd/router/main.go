@@ -16,6 +16,7 @@ import (
 	"github.com/oolxg/replicated-kv/internal/config"
 	"github.com/oolxg/replicated-kv/internal/coordinator"
 	"github.com/oolxg/replicated-kv/internal/ring"
+	"github.com/oolxg/replicated-kv/internal/shed"
 )
 
 func main() {
@@ -31,7 +32,8 @@ func main() {
 		logger.Warn("W+R <= RF: reads are not guaranteed to observe the newest write",
 			"rf", cfg.RF, "w", cfg.W, "r", cfg.R)
 	}
-	coord := coordinator.New(ring.New(cfg.Nodes), cfg.RF, cfg.W, cfg.R, logger)
+	coord := coordinator.New(ring.New(cfg.Nodes), cfg.RF, cfg.W, cfg.R,
+		shed.New(cfg.ShedConcurrent, cfg.ShedQueue), logger)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
