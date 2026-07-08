@@ -41,7 +41,7 @@ limitations slide).
 | 3 | Replication + quorum + LWW reconcile + read-repair | ✅ |
 | 4 | Load shedding (overload mitigation) | ✅ |
 | 5 | Retries (backoff + jitter) + read-through cache | ⏳ |
-| 6 | Terraform deploy (1 / 3 / 5 nodes) | ⏳ |
+| 6 | Terraform deploy (1 / 3 / 5 nodes) | ✅ |
 | 7 | k6 benchmark + scaling graph | ⏳ |
 
 ## Layer 1 — standalone storage node
@@ -194,6 +194,54 @@ p95 = 2.43ms  max = 36.8ms    ← same p95 as an unloaded run: no queue buildup
 The node kept serving, health checks stayed green, and the latency of
 *admitted* requests did not degrade — overload cost the excess callers a 503,
 not everyone a timeout.
+
+## Layer 6 — deploy to GCP (Terraform)
+
+Topology per apply: `node_count` storage VMs + 1 router VM (same machine type,
+as the assignment requires for the 1/3/5 comparison) + 1 beefier k6 loadgen VM,
+all in one subnet. Membership is static: internal IPs are fixed in Terraform
+before the VMs exist, so every startup script receives the full node list.
+Binaries are cross-compiled locally, shipped through a GCS bucket, and run
+under systemd.
+
+### One-time setup
+
+```sh
+brew install --cask gcloud-cli terraform   # if missing
+gcloud auth login                          # account holding the course credit
+gcloud auth application-default login      # credentials for Terraform
+gcloud projects create <PROJECT_ID>        # or reuse an existing project
+# link the project to the billing account with the course credit (Console → Billing),
+# then:
+gcloud services enable compute.googleapis.com --project <PROJECT_ID>
+```
+
+### Deploy (a: 1 node, b: 3 nodes, c: 5 nodes)
+
+```sh
+# build the linux binaries the VMs will run
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/linux_amd64/storage ./cmd/storage
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/linux_amd64/router ./cmd/router
+
+cd deploy/terraform
+terraform init
+terraform apply -var project=<PROJECT_ID> -var node_count=3   # 1 | 3 | 5
+
+# smoke test (also printed as the `smoke_test` output):
+curl -s -XPUT http://$(terraform output -raw router_public_ip):8080/kv/hello -d '{"value":"world"}'
+curl -s http://$(terraform output -raw router_public_ip):8080/kv/hello
+
+terraform destroy -var project=<PROJECT_ID>   # ALWAYS after a session — the credit is finite
+```
+
+Useful variables (see `variables.tf`): `machine_type` (bonus scale-up runs),
+`kv_rf/kv_w/kv_r` (`-var kv_rf=1` for the pure-sharding throughput benchmark),
+`kv_shed_*` (overload-demo tuning), `client_cidr` (lock the public port down
+to your IP).
+
+Cost: the full 5-node farm (7 × e2-class VMs) is ≈ $0.17/h — a two-hour
+benchmark session costs ~$0.35 of the $50 credit. The expensive failure mode
+is forgetting `terraform destroy`, not running benchmarks.
 
 ## License
 

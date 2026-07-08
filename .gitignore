@@ -7,14 +7,17 @@
 *.out
 coverage.*
 
-# Terraform state and local config (never commit credentials or state)
+# Terraform state, plans and local config (never commit credentials or state).
+# NOTE: .terraform.lock.hcl is deliberately NOT ignored — committing it pins
+# provider versions, which the assignment's "exact reproduction" requires.
 **/.terraform/*
 *.tfstate
 *.tfstate.*
+tfplan*
+*.tfplan
 crash.log
 *.tfvars
 !*.tfvars.example
-.terraform.lock.hcl
 
 # OS noise
 .DS_Store
