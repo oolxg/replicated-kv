@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config is the router's runtime configuration.
@@ -28,6 +29,12 @@ type Config struct {
 	// KV_SHED_QUEUE). Requests beyond concurrent+queue are answered 503.
 	ShedConcurrent int
 	ShedQueue      int
+
+	// Read-through cache for hot keys (KV_CACHE_SIZE / KV_CACHE_TTL).
+	// CacheSize 0 disables caching. The TTL bounds cross-router staleness:
+	// another router's write becomes visible here at most TTL later.
+	CacheSize int
+	CacheTTL  time.Duration
 }
 
 // StorageConfig is a storage node's runtime configuration.
@@ -119,6 +126,19 @@ func FromEnv() (Config, error) {
 	if err := validateShed(c.ShedConcurrent, c.ShedQueue); err != nil {
 		return Config{}, err
 	}
+
+	if c.CacheSize, err = intEnv("KV_CACHE_SIZE", 4096); err != nil {
+		return Config{}, err
+	}
+	if c.CacheSize < 0 {
+		return Config{}, fmt.Errorf("KV_CACHE_SIZE=%d must not be negative (0 disables the cache)", c.CacheSize)
+	}
+	if c.CacheTTL, err = durationEnv("KV_CACHE_TTL", time.Second); err != nil {
+		return Config{}, err
+	}
+	if c.CacheSize > 0 && c.CacheTTL <= 0 {
+		return Config{}, fmt.Errorf("KV_CACHE_TTL=%s must be positive when the cache is enabled", c.CacheTTL)
+	}
 	return c, nil
 }
 
@@ -139,4 +159,16 @@ func intEnv(key string, def int) (int, error) {
 		return 0, fmt.Errorf("%s=%q is not an integer", key, v)
 	}
 	return n, nil
+}
+
+func durationEnv(key string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s=%q is not a duration (e.g. 500ms, 2s)", key, v)
+	}
+	return d, nil
 }

@@ -13,8 +13,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/oolxg/replicated-kv/internal/cache"
 	"github.com/oolxg/replicated-kv/internal/config"
 	"github.com/oolxg/replicated-kv/internal/coordinator"
+	"github.com/oolxg/replicated-kv/internal/retry"
 	"github.com/oolxg/replicated-kv/internal/ring"
 	"github.com/oolxg/replicated-kv/internal/shed"
 )
@@ -32,8 +34,19 @@ func main() {
 		logger.Warn("W+R <= RF: reads are not guaranteed to observe the newest write",
 			"rf", cfg.RF, "w", cfg.W, "r", cfg.R)
 	}
-	coord := coordinator.New(ring.New(cfg.Nodes), cfg.RF, cfg.W, cfg.R,
-		shed.New(cfg.ShedConcurrent, cfg.ShedQueue), logger)
+	var hotCache *cache.Cache[coordinator.Versioned]
+	if cfg.CacheSize > 0 {
+		hotCache = cache.New[coordinator.Versioned](cfg.CacheSize, cfg.CacheTTL)
+	}
+	coord := coordinator.New(ring.New(cfg.Nodes), coordinator.Options{
+		RF:      cfg.RF,
+		W:       cfg.W,
+		R:       cfg.R,
+		Limiter: shed.New(cfg.ShedConcurrent, cfg.ShedQueue),
+		Cache:   hotCache,
+		Retry:   retry.Default(),
+		Log:     logger,
+	})
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

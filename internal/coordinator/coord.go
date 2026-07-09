@@ -22,6 +22,8 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/oolxg/replicated-kv/internal/cache"
+	"github.com/oolxg/replicated-kv/internal/retry"
 	"github.com/oolxg/replicated-kv/internal/ring"
 	"github.com/oolxg/replicated-kv/internal/shed"
 )
@@ -61,26 +63,44 @@ type replicaRead struct {
 	err   error
 }
 
+// Options configures a Coordinator.
+type Options struct {
+	// Quorum parameters; config validates 1 <= W,R <= RF <= ring nodes.
+	RF, W, R int
+	// Limiter sheds excess client load at the edge. Must be non-nil.
+	Limiter *shed.Limiter
+	// Cache, when non-nil, serves repeated reads of hot keys without a
+	// quorum fan-out; writes invalidate it.
+	Cache *cache.Cache[Versioned]
+	// Retry governs internal replica calls. The zero value performs single
+	// attempts (used by most tests); production passes retry.Default().
+	Retry retry.Policy
+	// Log must be non-nil.
+	Log *slog.Logger
+}
+
 // Coordinator fans client operations out to the key's replicas and collects
-// quorum. The quorum contract (1 <= W,R <= RF <= number of ring nodes) is
-// validated by config at startup.
+// quorum.
 type Coordinator struct {
 	ring     *ring.Ring
 	rf, w, r int
 	lim      *shed.Limiter
+	cache    *cache.Cache[Versioned]
+	retry    retry.Policy
 	client   *http.Client
 	log      *slog.Logger
 }
 
-// New returns a Coordinator over rg with the given quorum parameters,
-// shedding excess client load through lim. lim and log must be non-nil.
-func New(rg *ring.Ring, rf, w, r int, lim *shed.Limiter, log *slog.Logger) *Coordinator {
+// New returns a Coordinator over rg.
+func New(rg *ring.Ring, o Options) *Coordinator {
 	return &Coordinator{
-		ring: rg,
-		rf:   rf,
-		w:    w,
-		r:    r,
-		lim:  lim,
+		ring:  rg,
+		rf:    o.RF,
+		w:     o.W,
+		r:     o.R,
+		lim:   o.Limiter,
+		cache: o.Cache,
+		retry: o.Retry,
 		client: &http.Client{
 			Timeout: nodeRequestTimeout,
 			// Tuned for connection reuse to each storage node under load; the
@@ -91,7 +111,7 @@ func New(rg *ring.Ring, rf, w, r int, lim *shed.Limiter, log *slog.Logger) *Coor
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
-		log: log,
+		log: o.Log,
 	}
 }
 
@@ -130,6 +150,11 @@ func (c *Coordinator) Put(ctx context.Context, key, value string) error {
 			} else {
 				oks++
 				if oks >= c.w {
+					if c.cache != nil {
+						// Drop the (now stale) cached version so this
+						// router's clients read their own write.
+						c.cache.Invalidate(key)
+					}
 					return nil
 				}
 			}
@@ -140,21 +165,41 @@ func (c *Coordinator) Put(ctx context.Context, key, value string) error {
 	return fmt.Errorf("%w: %d of %d acks needed: %v", errNoQuorum, oks, c.w, lastErr)
 }
 
+// putReplica writes to one replica, retrying transient failures. Retrying a
+// PUT is safe: the body carries the same key/timestamp/value, and LWW makes
+// re-application a no-op. The context is deliberately Background — see Put.
 func (c *Coordinator) putReplica(node, key string, body []byte) error {
+	return c.retry.Do(context.Background(), func() error {
+		return c.putReplicaOnce(node, key, body)
+	})
+}
+
+func (c *Coordinator) putReplicaOnce(node, key string, body []byte) error {
 	req, err := http.NewRequest(http.MethodPut, nodeURL(node, "/internal/put/", key), bytes.NewReader(body))
 	if err != nil {
-		return err
+		return retry.Permanent(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("put to %s: %w", node, err)
+		return fmt.Errorf("put to %s: %w", node, err) // transport error: transient
 	}
 	defer drainClose(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("node %s returned status %d", node, resp.StatusCode)
+		return replicaStatusErr(node, resp.StatusCode)
 	}
 	return nil
+}
+
+// replicaStatusErr classifies a replica's non-200 answer for the retry
+// policy: 4xx answers are deterministic (retrying reproduces them), while a
+// 503 (shedding) or an unexpected 5xx may clear up a moment later.
+func replicaStatusErr(node string, code int) error {
+	err := fmt.Errorf("node %s returned status %d", node, code)
+	if code >= 400 && code < 500 {
+		return retry.Permanent(err)
+	}
+	return err
 }
 
 // Get fans the read out to the key's RF replicas, waits for R answers, and
@@ -163,6 +208,12 @@ func (c *Coordinator) putReplica(node, key string, body []byte) error {
 // does not exist. Replicas observed stale or missing are repaired
 // asynchronously with the winning version.
 func (c *Coordinator) Get(ctx context.Context, key string) (Versioned, bool, error) {
+	if c.cache != nil {
+		if v, ok := c.cache.Get(key); ok {
+			return v, true, nil // hot key: no quorum fan-out at all
+		}
+	}
+
 	replicas := c.ring.PreferenceList(key, c.rf)
 	if len(replicas) == 0 {
 		return Versioned{}, false, errNoNodes
@@ -211,17 +262,32 @@ func (c *Coordinator) Get(ctx context.Context, key string) (Versioned, bool, err
 		return Versioned{}, false, nil
 	}
 	c.repair(key, winner, reads)
+	if c.cache != nil {
+		c.cache.Put(key, winner)
+	}
 	return winner, true, nil
 }
 
+// getReplica reads from one replica, retrying transient failures. Reads are
+// idempotent, so retrying is always safe; ctx (the client request) bounds the
+// whole loop.
 func (c *Coordinator) getReplica(ctx context.Context, node, key string) replicaRead {
+	var rd replicaRead
+	_ = c.retry.Do(ctx, func() error {
+		rd = c.getReplicaOnce(ctx, node, key)
+		return rd.err
+	})
+	return rd
+}
+
+func (c *Coordinator) getReplicaOnce(ctx context.Context, node, key string) replicaRead {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nodeURL(node, "/internal/get/", key), nil)
 	if err != nil {
-		return replicaRead{node: node, err: err}
+		return replicaRead{node: node, err: retry.Permanent(err)}
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return replicaRead{node: node, err: fmt.Errorf("get from %s: %w", node, err)}
+		return replicaRead{node: node, err: fmt.Errorf("get from %s: %w", node, err)} // transient
 	}
 	defer drainClose(resp.Body)
 
@@ -229,13 +295,13 @@ func (c *Coordinator) getReplica(ctx context.Context, node, key string) replicaR
 	case http.StatusOK:
 		var v Versioned
 		if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
-			return replicaRead{node: node, err: fmt.Errorf("decode from %s: %w", node, err)}
+			return replicaRead{node: node, err: retry.Permanent(fmt.Errorf("decode from %s: %w", node, err))}
 		}
 		return replicaRead{node: node, v: v, found: true}
 	case http.StatusNotFound:
 		return replicaRead{node: node}
 	default:
-		return replicaRead{node: node, err: fmt.Errorf("node %s returned status %d", node, resp.StatusCode)}
+		return replicaRead{node: node, err: replicaStatusErr(node, resp.StatusCode)}
 	}
 }
 

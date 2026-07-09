@@ -40,7 +40,7 @@ limitations slide).
 | 2 | Router + consistent-hash ring + forwarding (RF=1) | ✅ |
 | 3 | Replication + quorum + LWW reconcile + read-repair | ✅ |
 | 4 | Load shedding (overload mitigation) | ✅ |
-| 5 | Retries (backoff + jitter) + read-through cache | ⏳ |
+| 5 | Retries (backoff + jitter) + read-through cache | ✅ |
 | 6 | Terraform deploy (1 / 3 / 5 nodes) | ✅ |
 | 7 | k6 benchmark + scaling graph | ⏳ |
 
@@ -194,6 +194,37 @@ p95 = 2.43ms  max = 36.8ms    ← same p95 as an unloaded run: no queue buildup
 The node kept serving, health checks stayed green, and the latency of
 *admitted* requests did not degrade — overload cost the excess callers a 503,
 not everyone a timeout.
+
+## Layer 5 — retries + read-through cache (the two extra strategies)
+
+Both hand-implemented (assignment requirement 4).
+
+**Retries with exponential backoff and full jitter** (`internal/retry`):
+router→replica calls retry transient failures — connection refused, timeouts,
+`503` from a shedding node — up to 3 attempts, sleeping `rand(0, 50ms·2^n)`
+capped at 1s between tries. Full jitter prevents synchronized retriers from
+reproducing the burst that shed them. Deterministic failures (4xx) are marked
+`Permanent` and never retried. Retrying is safe because both internal ops are
+idempotent: a re-sent PUT carries the same key/timestamp/value and LWW
+deduplicates it.
+
+**Read-through LRU+TTL cache** (`internal/cache`, on the router): a GET
+checks the cache first — a hit answers without any quorum fan-out; a miss
+does the quorum read and populates. A successful PUT invalidates the key, so
+each router reads its own writes. Config: `KV_CACHE_SIZE` (entries, 0
+disables; default 4096) and `KV_CACHE_TTL` (default 1s).
+
+Hot-key measurement (50 VUs, one key, local 3-node cluster):
+
+| | ops/s | avg | p95 |
+|---|---|---|---|
+| cache off | 3 292 | 15.15ms | 39.3ms |
+| cache on | 98 248 | 477µs | 1.05ms |
+
+**Known limitation** (deliberate): the cache is per-router. With several
+routers, a write through router A leaves router B's cached copy stale until
+its TTL expires — cross-router staleness is bounded by `KV_CACHE_TTL`, not
+eliminated.
 
 ## Layer 6 — deploy to GCP (Terraform)
 

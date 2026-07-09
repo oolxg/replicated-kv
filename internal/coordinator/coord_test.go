@@ -11,9 +11,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/oolxg/replicated-kv/internal/cache"
+	"github.com/oolxg/replicated-kv/internal/retry"
 	"github.com/oolxg/replicated-kv/internal/ring"
 	"github.com/oolxg/replicated-kv/internal/shed"
 	"github.com/oolxg/replicated-kv/internal/storage"
@@ -25,6 +28,13 @@ func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard,
 // wideShed returns a limiter generous enough to never shed in tests that are
 // not about shedding.
 func wideShed() *shed.Limiter { return shed.New(1024, 1024) }
+
+// opts builds coordinator Options with the given quorum and harmless
+// defaults: no cache, single-attempt calls (retry-specific tests set their
+// own policy).
+func opts(rf, w, r int) Options {
+	return Options{RF: rf, W: w, R: r, Limiter: wideShed(), Log: discardLog()}
+}
 
 // testNode is one real storage node: its HTTP server plus a handle on the
 // underlying store, so tests can seed or inspect replica state directly.
@@ -66,7 +76,7 @@ func newCoord(t *testing.T, nodes []*testNode) *Coordinator {
 	t.Helper()
 	a := addrsOf(nodes)
 	rf := min(3, len(a))
-	return New(ring.New(a), rf, rf/2+1, rf/2+1, wideShed(), discardLog())
+	return New(ring.New(a), opts(rf, rf/2+1, rf/2+1))
 }
 
 // waitFor polls cond until it holds or the deadline passes.
@@ -153,7 +163,7 @@ func TestCoordinatorGetMissing(t *testing.T) {
 
 func TestSingleNodeDegeneratesToLayer2(t *testing.T) {
 	nodes := startNodes(t, 1)
-	c := New(ring.New(addrsOf(nodes)), 1, 1, 1, wideShed(), discardLog())
+	c := New(ring.New(addrsOf(nodes)), opts(1, 1, 1))
 	ctx := context.Background()
 
 	if err := c.Put(ctx, "k", "v"); err != nil {
@@ -305,7 +315,7 @@ func TestGetReconcileNewestWins(t *testing.T) {
 func TestReadRepairHeals(t *testing.T) {
 	t.Run("missing replica", func(t *testing.T) {
 		nodes := startNodes(t, 3)
-		c := New(ring.New(addrsOf(nodes)), 3, 2, 3, wideShed(), discardLog())
+		c := New(ring.New(addrsOf(nodes)), opts(3, 2, 3))
 
 		nodes[0].store.Put("k", []byte("v"), 5)
 		nodes[1].store.Put("k", []byte("v"), 5)
@@ -323,7 +333,7 @@ func TestReadRepairHeals(t *testing.T) {
 
 	t.Run("stale replica", func(t *testing.T) {
 		nodes := startNodes(t, 3)
-		c := New(ring.New(addrsOf(nodes)), 3, 2, 3, wideShed(), discardLog())
+		c := New(ring.New(addrsOf(nodes)), opts(3, 2, 3))
 
 		nodes[0].store.Put("k", []byte("stale"), 1)
 		nodes[1].store.Put("k", []byte("fresh"), 2)
@@ -373,7 +383,7 @@ func TestTimeoutCountsAsFailure(t *testing.T) {
 				t.Cleanup(hang.Close)
 				all = append(all, strings.TrimPrefix(hang.URL, "http://"))
 			}
-			c := New(ring.New(all), 3, 2, 2, wideShed(), discardLog())
+			c := New(ring.New(all), opts(3, 2, 2))
 			c.client.Timeout = 250 * time.Millisecond // fail hanging calls fast
 
 			err := c.Put(context.Background(), "k", "v")
@@ -478,7 +488,7 @@ func TestReplicaShedCountsAsFailure(t *testing.T) {
 				t.Cleanup(overloaded.Close)
 				all = append(all, strings.TrimPrefix(overloaded.URL, "http://"))
 			}
-			c := New(ring.New(all), 3, 2, 2, wideShed(), discardLog())
+			c := New(ring.New(all), opts(3, 2, 2))
 
 			err := c.Put(context.Background(), "k", "v")
 			if tt.wantErr {
@@ -503,6 +513,110 @@ func TestReplicaShedCountsAsFailure(t *testing.T) {
 				t.Fatalf("get with %d shedding replicas: %q found=%v err=%v", tt.shedding, v.Value, found, err)
 			}
 		})
+	}
+}
+
+// TestCacheServesRepeatedReadsWithoutQuorum: after one quorum read the value
+// must come from the router's cache — proven by killing the entire cluster
+// and reading again.
+func TestCacheServesRepeatedReadsWithoutQuorum(t *testing.T) {
+	nodes := startNodes(t, 3)
+	o := opts(3, 2, 2)
+	o.Cache = cache.New[Versioned](64, time.Minute)
+	c := New(ring.New(addrsOf(nodes)), o)
+	ctx := context.Background()
+
+	if err := c.Put(ctx, "hot", "v1"); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if _, found, err := c.Get(ctx, "hot"); err != nil || !found {
+		t.Fatalf("first get: found=%v err=%v", found, err)
+	}
+
+	for _, n := range nodes {
+		n.srv.Close() // no cluster left: only the cache can answer now
+	}
+	v, found, err := c.Get(ctx, "hot")
+	if err != nil || !found || v.Value != "v1" {
+		t.Fatalf("cached get after cluster death: %q found=%v err=%v", v.Value, found, err)
+	}
+}
+
+// TestPutInvalidatesCache: a write through this router must not leave a stale
+// cached version behind.
+func TestPutInvalidatesCache(t *testing.T) {
+	nodes := startNodes(t, 3)
+	o := opts(3, 2, 2)
+	o.Cache = cache.New[Versioned](64, time.Minute)
+	c := New(ring.New(addrsOf(nodes)), o)
+	ctx := context.Background()
+
+	if err := c.Put(ctx, "k", "v1"); err != nil {
+		t.Fatalf("put v1: %v", err)
+	}
+	if v, _, _ := c.Get(ctx, "k"); v.Value != "v1" {
+		t.Fatalf("expected v1 cached, got %q", v.Value)
+	}
+	if err := c.Put(ctx, "k", "v2"); err != nil {
+		t.Fatalf("put v2: %v", err)
+	}
+	v, found, err := c.Get(ctx, "k")
+	if err != nil || !found || v.Value != "v2" {
+		t.Fatalf("get after overwrite: %q found=%v err=%v — stale cache?", v.Value, found, err)
+	}
+}
+
+// TestRetryRecoversTransientFailures: a replica that sheds twice and then
+// recovers must be invisible to the client when retries are enabled. RF=1
+// so the flaky node is the only replica — success is attributable to retry.
+func TestRetryRecoversTransientFailures(t *testing.T) {
+	inner := storage.NewHandler(store.New(), wideShed(), discardLog()).Routes()
+	var calls atomic.Int32
+	flaky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) <= 2 {
+			http.Error(w, "overloaded", http.StatusServiceUnavailable)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(flaky.Close)
+
+	o := opts(1, 1, 1)
+	o.Retry = retry.Policy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond}
+	c := New(ring.New([]string{strings.TrimPrefix(flaky.URL, "http://")}), o)
+	ctx := context.Background()
+
+	if err := c.Put(ctx, "k", "v"); err != nil {
+		t.Fatalf("put through flaky replica: %v (attempts made: %d)", err, calls.Load())
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("replica saw %d calls, want exactly 3 (2 shed + 1 success)", got)
+	}
+	v, found, err := c.Get(ctx, "k")
+	if err != nil || !found || v.Value != "v" {
+		t.Fatalf("get after retried put: %q found=%v err=%v", v.Value, found, err)
+	}
+}
+
+// TestClientErrorsAreNotRetried: a deterministic 4xx from a replica must fail
+// after exactly one attempt — retrying reproduces it and only adds latency.
+func TestClientErrorsAreNotRetried(t *testing.T) {
+	var calls atomic.Int32
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+	t.Cleanup(bad.Close)
+
+	o := opts(1, 1, 1)
+	o.Retry = retry.Policy{MaxAttempts: 5, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond}
+	c := New(ring.New([]string{strings.TrimPrefix(bad.URL, "http://")}), o)
+
+	if err := c.Put(context.Background(), "k", "v"); err == nil {
+		t.Fatal("expected error from a 400 replica")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("replica saw %d calls, want exactly 1: 4xx must not be retried", got)
 	}
 }
 
