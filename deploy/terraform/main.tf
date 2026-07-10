@@ -113,6 +113,8 @@ resource "google_compute_instance" "storage" {
   machine_type = var.machine_type
   tags         = ["kv-node"]
 
+  allow_stopping_for_update = true
+
   boot_disk {
     initialize_params {
       image = local.image
@@ -127,9 +129,10 @@ resource "google_compute_instance" "storage" {
 
   metadata = {
     startup-script = templatefile("${path.module}/templates/service.sh.tpl", {
-      bucket = google_storage_bucket.bin.name
-      binary = "storage"
-      env    = local.storage_env
+      bucket    = google_storage_bucket.bin.name
+      binary    = "storage"
+      env       = local.storage_env
+      cpu_quota = var.storage_cpu_quota
     })
     binary-md5 = google_storage_bucket_object.storage_bin.md5hash # replace VM when the binary changes
   }
@@ -139,10 +142,24 @@ resource "google_compute_instance" "storage" {
   }
 }
 
+# The router only reads its env at boot, so any change to the rendered config
+# (e.g. a different node_count changing KV_NODES) must recreate the VM instead
+# of silently updating metadata that will never be re-executed.
+resource "terraform_data" "router_cfg" {
+  input = local.router_env
+}
+
 resource "google_compute_instance" "router" {
   name         = "kv-router"
-  machine_type = var.machine_type
+  machine_type = var.router_machine_type
   tags         = ["kv-router"]
+
+  # Machine-type changes stop/start the VM instead of failing the apply.
+  allow_stopping_for_update = true
+
+  lifecycle {
+    replace_triggered_by = [terraform_data.router_cfg]
+  }
 
   boot_disk {
     initialize_params {
@@ -158,9 +175,10 @@ resource "google_compute_instance" "router" {
 
   metadata = {
     startup-script = templatefile("${path.module}/templates/service.sh.tpl", {
-      bucket = google_storage_bucket.bin.name
-      binary = "router"
-      env    = local.router_env
+      bucket    = google_storage_bucket.bin.name
+      binary    = "router"
+      env       = local.router_env
+      cpu_quota = "" # the router is never artificially capped
     })
     binary-md5 = google_storage_bucket_object.router_bin.md5hash
   }
@@ -171,9 +189,12 @@ resource "google_compute_instance" "router" {
 }
 
 resource "google_compute_instance" "loadgen" {
+  count        = var.loadgen_enabled ? 1 : 0
   name         = "kv-loadgen"
   machine_type = var.loadgen_machine_type
   tags         = ["kv-loadgen"]
+
+  allow_stopping_for_update = true
 
   boot_disk {
     initialize_params {

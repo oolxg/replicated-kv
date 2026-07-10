@@ -13,7 +13,7 @@ output "storage_internal_ips" {
 }
 
 output "loadgen_ssh" {
-  value       = "gcloud compute ssh kv-loadgen --zone ${var.zone}"
+  value       = var.loadgen_enabled ? "gcloud compute ssh kv-loadgen --zone ${var.zone}" : "(loadgen VM disabled)"
   description = "How to reach the k6 VM"
 }
 

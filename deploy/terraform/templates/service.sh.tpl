@@ -24,6 +24,9 @@ Wants=network-online.target
 [Service]
 EnvironmentFile=/etc/kv-${binary}.env
 ExecStart=/usr/local/bin/kv-${binary}
+%{ if cpu_quota != "" ~}
+CPUQuota=${cpu_quota}
+%{ endif ~}
 Restart=on-failure
 RestartSec=1
 
@@ -33,3 +36,9 @@ UNITEOF
 
 systemctl daemon-reload
 systemctl enable --now kv-${binary}.service
+# First-boot race: enable --now can pick the unit up before the reload fully
+# lands, silently dropping resource directives (observed: CPUQuota ignored).
+# A reload+restart straight after is idempotent and guarantees the loaded
+# unit matches the file on disk.
+systemctl daemon-reload
+systemctl restart kv-${binary}.service

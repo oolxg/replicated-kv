@@ -42,7 +42,7 @@ limitations slide).
 | 4 | Load shedding (overload mitigation) | ✅ |
 | 5 | Retries (backoff + jitter) + read-through cache | ✅ |
 | 6 | Terraform deploy (1 / 3 / 5 nodes) | ✅ |
-| 7 | k6 benchmark + scaling graph | ⏳ |
+| 7 | k6 benchmark + scaling graph | ✅ |
 
 ## Layer 1 — standalone storage node
 
@@ -273,6 +273,77 @@ to your IP).
 Cost: the full 5-node farm (7 × e2-class VMs) is ≈ $0.17/h — a two-hour
 benchmark session costs ~$0.35 of the $50 credit. The expensive failure mode
 is forgetting `terraform destroy`, not running benchmarks.
+
+## Layer 7 — benchmarks: the scaling curve
+
+![throughput vs nodes](bench/results/throughput.png)
+
+| Nodes | Throughput | Scaling | p99 | Control run delta |
+|------:|-----------:|--------:|----:|------------------:|
+| 1 | 6 835 req/s | ×1.00 | 101 ms | 0.7% |
+| 3 | 13 014 req/s | ×1.90 | 89 ms | 1.2% |
+| 5 | 17 972 req/s | ×2.63 | 88 ms | 4.3% |
+
+Workload: 90% GET / 10% PUT over 100k uniformly random keys (a hot key would
+pin its load to one node and flatten the curve), RF=1 — pure sharding;
+replication is the fault-tolerance demo, not the throughput number. k6 runs
+from a VM inside the VPC against the router's internal IP.
+
+### Methodology (what it took to get noise-free numbers)
+
+- **Dedicated-core nodes with a fixed CPU budget.** Storage nodes are
+  n1-standard-1 with the service cgroup-capped at `CPUQuota=25%`. Shared-core
+  E2 machines made results depend on their burst-credit state (the same
+  3-node setup measured 7.3k and 11.7k req/s in different runs); a dedicated
+  core with a fixed quota is deterministic. GCP sells no dedicated machine
+  smaller than 1 vCPU, so the "small node" is emulated in systemd.
+- **Keyspace pre-seeded before measuring.** Without it, GETs start as cheap
+  404s and get more expensive as PUTs fill the store — throughput drifts for
+  minutes. `bench/k6/seed.js` writes all 100k keys first.
+- **Every point is verified by a control run**: a second, independent 60s
+  window must agree with the first (deltas above). A >5% disagreement means
+  not-steady-state and the point is discarded.
+- **Nothing else may be the bottleneck**: router and loadgen are e2-standard-8
+  (measured single-router ceilings: e2-small 7.3k, e2-standard-2 10k req/s —
+  an equal-hardware coordinator caps the whole cluster below one node's
+  capacity, because a routed request costs ~2.5x a storage request). The
+  runner asserts the CPU quota is live on the nodes before each measurement.
+- **Offered load sits at the throughput peak.** VUS=300 saturates every
+  configuration; pushing harder degrades goodput (5 nodes: 18.0k at 300 VUs,
+  14.4k at 600, 12.3k at 900) — queueing overhead, not extra capacity.
+
+### Bonus: scale-up × scale-out
+
+The same three configurations, re-run with each node's CPU budget raised from
+25% to 40% (`CPU_QUOTA=40%`) — vertical scaling along the exact axis that
+defines node size in this setup:
+
+| Nodes | 25% budget | 40% budget | Scale-up gain |
+|------:|-----------:|-----------:|--------------:|
+| 1 | 6 835 req/s | 10 916 req/s | ×1.60 |
+| 3 | 13 014 req/s | 19 872 req/s | ×1.53 |
+| 5 | 17 972 req/s | 26 299 req/s | ×1.46 |
+
+The single-node gain (×1.60) matches the budget increase (40/25 = 1.6)
+exactly, validating that node throughput is CPU-bound and the budget is the
+real knob. Control-run deltas: 0.4% / 0.1% / 2.7%.
+
+Note: the bonus set ran in `europe-west4` (n1-standard-1 was stocked out
+across all `europe-west3` zones at the time — `REGION`/`ZONE` are variables
+precisely for this). The exact ×1.60 single-node ratio confirms per-core
+parity between the regions.
+
+### Reproduce
+
+```sh
+for n in 1 3 5; do ./bench/run.sh $n <PROJECT_ID>; done   # ~7 min per point
+# bonus scale-up set:
+for n in 1 3 5; do CPU_QUOTA=40% VUS=450 OUT_DIR=bench/results/scaleup ./bench/run.sh $n <PROJECT_ID>; done
+python3 bench/plot.py                                     # renders the chart
+```
+
+Each run deploys the configuration from scratch, seeds, measures, verifies,
+collects `bench/results/nodes-N.json` and destroys the deployment.
 
 ## License
 
