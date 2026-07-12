@@ -8,6 +8,10 @@ quorum replication with a clean stateless/stateful split.
 > **Status — built layer by layer.** Each layer compiles, runs, and passes its
 > tests before the next begins. See [Build status](#build-status).
 
+## Usernames
+
+oolxg - Oleg Mihajlov
+
 ## Architecture (target)
 
 ```
